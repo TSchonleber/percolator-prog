@@ -1643,10 +1643,7 @@ fn v16_program_prospective_loss_expiry_matrix_keeps_resolved_exit_live() {
         let close = env.send(
             ProgInstruction::PermissionlessCrank {
                 now_slot: u64::MAX,
-                observations: vec![CrankObservationHint {
-                    asset_index: u16::MAX,
-                    oracle_accounts: u8::MAX,
-                }],
+                observations: vec![],
             },
             vec![
                 AccountMeta::new_readonly(owner.pubkey(), false),
@@ -1839,8 +1836,8 @@ fn v16_program_prospective_source_expiry_prerequisite_matrix_keeps_exit_live() {
             ProgInstruction::PermissionlessCrank {
                 now_slot: u64::MAX,
                 observations: vec![CrankObservationHint {
-                    asset_index: u16::MAX,
-                    oracle_accounts: u8::MAX,
+                    asset_index: 0,
+                    oracle_accounts: 0,
                 }],
             },
             vec![
@@ -2514,10 +2511,7 @@ fn v16_attack_resolved_permissionless_crank_survives_drained_owner_system_accoun
         .send(
             ProgInstruction::PermissionlessCrank {
                 now_slot: u64::MAX,
-                observations: vec![CrankObservationHint {
-                    asset_index: u16::MAX,
-                    oracle_accounts: u8::MAX,
-                }],
+                observations: vec![],
             },
             vec![
                 AccountMeta::new_readonly(owner.pubkey(), false),

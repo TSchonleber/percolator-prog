@@ -1185,6 +1185,9 @@ fn run_hybrid_price_cap_endpoint(crank_slots: &[u64]) -> u64 {
     for &slot in crank_slots {
         assert!(slot > previous_slot && slot <= 10);
         set_test_clock(&mut env, slot, 100 + slot as i64);
+        // Re-post the same target price: stale-account refresh consumes a report this slot.
+        let target =
+            env.set_pyth_price_with_conf(&feed, TARGET_PRICE as i64, -6, 0, 100 + slot as i64);
         env.svm.expire_blockhash();
         env.crank_with_oracle_tail(
             long,

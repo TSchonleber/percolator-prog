@@ -1492,9 +1492,10 @@ fn v16_program_dual_quote_terminal_history_classifies_stock_and_exact_tombstone_
                         AccountMeta::new_readonly(spl_token::ID, false),
                     ],
                 ),
+                // The preceding insurance payout consumes asset 0's authority epoch.
                 wrap(
                     ProgInstruction::CloseSlab {
-                        authority_epoch: env.control_sequences(0).authority_epoch,
+                        authority_epoch: env.control_sequences(0).authority_epoch + 1,
                     },
                     vec![
                         AccountMeta::new(env.admin.pubkey(), true),
