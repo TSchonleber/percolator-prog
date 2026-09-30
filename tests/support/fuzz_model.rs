@@ -15830,6 +15830,53 @@ fn run_underfunded_terminal_world(
             }
         }
         if !sweep_mutated {
+            // A partial receipt stays open while fresh source backing could still
+            // raise its rate; the only public continuation is to let that backing
+            // lapse and normalize it through a hinted resolved crank.
+            let node = runner.bounded_reference_node()?;
+            let bucket = &node.source_backing_buckets[BACKED_DOMAIN];
+            if bucket.status == BackingBucketStatusV16::Fresh as u8 {
+                let expiry_slot = bucket.expiry_slot;
+                if runner.env.current_slot() < expiry_slot {
+                    runner.env.warp_to_slot(expiry_slot);
+                }
+                // Source domains are not asset indices; the hint names the asset
+                // whose backing lapsed, so take the first asset the program accepts.
+                let now_slot = runner.env.current_slot();
+                let mut landed = Err(String::new());
+                for asset_index in 0..u16::try_from(node.source_backing_buckets.len())
+                    .map_err(|_| "INV-086 source domain count exceeds u16")?
+                {
+                    let hint = CrankObservationHint {
+                        asset_index,
+                        oracle_accounts: 0,
+                    };
+                    landed = runner.env.crank_resolved_primary_signed(
+                        JUNIOR_WINNER,
+                        now_slot,
+                        vec![hint],
+                    );
+                    if landed.is_ok() {
+                        break;
+                    }
+                }
+                landed.map_err(|error| {
+                    format!("INV-086 hinted expiry crank at sweep {sweep}: {error}")
+                })?;
+                runner.assert_global_invariants()?;
+                let after = runner.bounded_reference_node()?;
+                if after.source_backing_buckets[BACKED_DOMAIN].status
+                    == BackingBucketStatusV16::Fresh as u8
+                {
+                    return Err(format!(
+                        "INV-086 hinted crank did not normalize lapsed backing at sweep {sweep}"
+                    ));
+                }
+                expiry_normalized_on_edge = true;
+                nodes.insert(node);
+                nodes.insert(after);
+                continue;
+            }
             return Err(format!(
                 "INV-086 underfunded terminal graph fixed at nonterminal sweep {sweep}"
             ));
