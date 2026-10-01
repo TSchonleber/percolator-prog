@@ -148,15 +148,91 @@ impl Entitlements {
     }
 }
 
-fn terminal_fee_loss_world() -> (TerminalEarningsWorld, Keypair, Pubkey) {
+// percolator-prog#451 (engine #215/#223/#224): the claimant's floored source residue
+// stays on an open receipt until pledged provider backing lapses, and that lapse pays
+// it in full. Before expiry the provider may take only the resolved surplus (signed);
+// fee, insurance and slab cleanup wait for the claimant's portfolio to close.
+const RECEIPT_SHORTFALL: u64 = SOURCE_PRINCIPAL;
+const CLAIMANT_FINAL: u64 = USER_PAID[1] + RECEIPT_SHORTFALL;
+
+fn terminal_fee_loss_world() -> (TerminalEarningsWorld, Keypair, Keypair, Pubkey) {
     terminal_fee_loss_world_with_quote(false)
 }
 
-fn terminal_fee_loss_world_with_quote(native: bool) -> (TerminalEarningsWorld, Keypair, Pubkey) {
+/// Provider-signed resolved surplus exit from the domain-1 bucket. Keeping `retained`
+/// atoms beyond the receipt's need routes exactly `retained` to recredit/residue at expiry.
+fn resolved_surplus_exit(
+    env: &V16CuEnv,
+    wallets: [Pubkey; 5],
+    tokens: [Pubkey; 5],
+    retained: u64,
+) -> Instruction {
+    let mut ix = reserve_payout(
+        env,
+        wallets,
+        tokens,
+        Pubkey::default(),
+        0,
+        BACKING - retained - RECEIPT_SHORTFALL,
+    );
+    ix.accounts[0].is_signer = true;
+    ix
+}
+
+/// At backing expiry a hinted crank lapses the retained bucket (first transaction,
+/// market only); the claimant then takes its now full-face top-up and its terminal
+/// portfolio returns rent to the slab (second transaction).
+fn claimant_expiry(
+    env: &V16CuEnv,
+    wallets: [Pubkey; 5],
+    tokens: [Pubkey; 5],
+    portfolios: [Pubkey; 2],
+    slot: u64,
+) -> [Vec<Instruction>; 2] {
+    let user = |instruction: ProgInstruction| Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(wallets[1], false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolios[1], false),
+            AccountMeta::new(tokens[1], false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: instruction.encode(),
+    };
+    [
+        vec![user(ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: crank_observations(0),
+        })],
+        vec![
+            user(ProgInstruction::ClaimResolvedPayoutTopup),
+            Instruction {
+                program_id: env.program_id,
+                accounts: vec![
+                    AccountMeta::new(wallets[1], true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(portfolios[1], false),
+                ],
+                data: env.close_portfolio_ix(portfolios[1]).encode(),
+            },
+        ],
+    ]
+}
+
+/// Resolved fee/loss world: the loser is terminal and closed; the claimant holds an
+/// open receipt short by `RECEIPT_SHORTFALL` while all provider backing is Fresh.
+fn terminal_fee_loss_world_with_quote(
+    native: bool,
+) -> (TerminalEarningsWorld, Keypair, Keypair, Pubkey) {
     let (mut world, users, insurer, admin_token) = terminal_fee_loss_prefix(native, None);
     for _ in 0..8 {
         for actor in [0, 1] {
-            if !resolved_portfolio_is_terminal(&world.env, world.portfolios[actor]) {
+            if !resolved_portfolio_is_terminal(&world.env, world.portfolios[actor])
+                && !resolved_receipt(&world.env.portfolio_state(world.portfolios[actor])).present
+            {
                 world.env.svm.expire_blockhash();
                 world
                     .env
@@ -178,28 +254,49 @@ fn terminal_fee_loss_world_with_quote(native: bool) -> (TerminalEarningsWorld, K
                     .unwrap();
             }
         }
-        if world
-            .portfolios
-            .iter()
-            .all(|key| resolved_portfolio_is_terminal(&world.env, *key))
-        {
+        if world.portfolios.iter().all(|key| {
+            resolved_portfolio_is_terminal(&world.env, *key)
+                || resolved_receipt(&world.env.portfolio_state(*key)).present
+        }) {
             break;
         }
     }
     for actor in 0..2 {
-        assert!(resolved_portfolio_is_terminal(
-            &world.env,
-            world.portfolios[actor]
-        ));
         assert_eq!(
             world.env.token_amount(world.tokens[actor]),
             USER_PAID[actor]
         );
-        world
-            .env
-            .close_portfolio_with_cu(&users[actor], world.portfolios[actor]);
     }
-    (world, insurer, admin_token)
+    assert!(resolved_portfolio_is_terminal(
+        &world.env,
+        world.portfolios[0]
+    ));
+    let receipt = resolved_receipt(&world.env.portfolio_state(world.portfolios[1]));
+    assert!(receipt.present && !receipt.finalized);
+    assert_eq!(
+        receipt.terminal_positive_claim_face,
+        u128::from(SOURCE_FACE - SOURCE_PAID)
+    );
+    assert_eq!(
+        receipt.terminal_positive_claim_face - receipt.paid_effective,
+        u128::from(RECEIPT_SHORTFALL)
+    );
+    let group = world.env.market_state().1;
+    for domain in 0..2 {
+        assert_eq!(
+            group.source_backing_buckets[domain].status,
+            BackingBucketStatusV16::Fresh
+        );
+    }
+    assert_eq!(
+        group.source_backing_buckets[1].fresh_unliened_backing_num,
+        u128::from(BACKING) * BOUND_SCALE
+    );
+    world
+        .env
+        .close_portfolio_with_cu(&users[0], world.portfolios[0]);
+    let [_, claimant] = users;
+    (world, claimant, insurer, admin_token)
 }
 
 fn terminal_fee_loss_prefix(

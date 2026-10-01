@@ -14095,6 +14095,13 @@ pub struct CloseToPartialReceiptEvidence {
     pub slab_custody_burned: u128,
     pub slab_close_compute_units: u64,
     pub slab_closed: bool,
+    pub resolved_junior_need: u128,
+    pub pre_expiry_fresh_backing: u128,
+    pub resolved_surplus_withdrawn: u128,
+    pub surplus_overdraw_rejections: usize,
+    pub pre_expiry_slab_close_rejected: bool,
+    pub terminal_landing_slot: u64,
+    pub payout_campaign_start_slot: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15106,22 +15113,110 @@ fn finish_close_to_partial_receipt_composition(
             .env
             .token_amount(runner.env.actors[JUNIOR_WINNER].destination_token),
     );
-    runner.run_terminal_payout_campaign()?;
-    runner.assert_global_invariants()?;
+    let mut max_compute_units_pre = 0u64;
+    let mut resolved_junior_need = 0u128;
+    let mut pre_expiry_fresh_backing = 0u128;
+    let mut resolved_surplus_withdrawn = 0u128;
+    let mut surplus_overdraw_rejections = 0usize;
+    let mut pre_expiry_slab_close_rejected = false;
     if let Some(terminal_cleanup_slot) = terminal_cleanup_slot {
-        // The open partial receipt waits on fresh source backing. Since wrapper #451 the
-        // provider may withdraw resolved surplus early, but the backing the receipt still
-        // needs to reach full face stays pledged, so the payout campaign can only finish by
-        // letting that backing lapse.
-        if runner.env.current_slot() > terminal_cleanup_slot {
-            return Err(format!(
-                "INV-070 terminal payout could not finish by cleanup slot {terminal_cleanup_slot}: \
-                 the open receipt forced fresh provider backing to lapse at slot {} \
-                 (the receipt still needs that pledged backing, wrapper #451)",
-                runner.env.current_slot()
-            ));
+        // Wrapper #451: after resolution the provider may withdraw (signed) only the Fresh
+        // backing above the resolved reserve. Each bucket keeps the junior need
+        // ceil(B / BOUND_SCALE) - R plus its own domain source claims at full face; the
+        // reserve stays pledged until it lapses and then pays the open receipt in full.
+        let (_, group) = runner.env.primary_market_state();
+        let ledger = group.resolved_payout_ledger;
+        let claim_bound = ledger
+            .terminal_claim_exact_receipts_num
+            .checked_add(ledger.terminal_claim_bound_unreceipted_num)
+            .ok_or("INV-086 resolved claim-bound overflow")?;
+        resolved_junior_need = claim_bound
+            .div_ceil(BOUND_SCALE)
+            .checked_sub(ledger.snapshot_residual)
+            .ok_or("INV-086 resolved residual exceeds the claim bound")?;
+        for (domain, bucket) in group.source_backing_buckets.iter().enumerate() {
+            if bucket.status != BackingBucketStatusV16::Fresh
+                || bucket.fresh_unliened_backing_num == 0
+            {
+                continue;
+            }
+            if bucket.fresh_unliened_backing_num % BOUND_SCALE != 0 {
+                return Err(format!(
+                    "INV-086 pre-expiry domain {domain} backing is not atom-aligned: {}",
+                    bucket.fresh_unliened_backing_num
+                ));
+            }
+            let fresh = bucket.fresh_unliened_backing_num / BOUND_SCALE;
+            pre_expiry_fresh_backing = pre_expiry_fresh_backing
+                .checked_add(fresh)
+                .ok_or("INV-086 pre-expiry backing sum overflow")?;
+            let reserve = resolved_junior_need
+                .checked_add(group.source_credit[domain].positive_claim_bound_num.div_ceil(BOUND_SCALE))
+                .ok_or("INV-086 resolved reserve overflow")?;
+            let surplus = fresh.saturating_sub(reserve);
+            if surplus != 0 {
+                let destination_before =
+                    u128::from(runner.env.token_amount(runner.env.provider_destination_token));
+                let withdraw = runner
+                    .env
+                    .withdraw_backing_bucket(domain as u16, surplus)
+                    .map_err(|error| {
+                        format!("INV-086 resolved surplus withdrawal domain {domain}: {error}")
+                    })?;
+                max_compute_units_pre = max_compute_units_pre.max(withdraw.compute_units);
+                if u128::from(runner.env.token_amount(runner.env.provider_destination_token))
+                    != destination_before + surplus
+                {
+                    return Err(format!(
+                        "INV-086 resolved surplus withdrawal domain {domain} moved the wrong amount"
+                    ));
+                }
+                resolved_surplus_withdrawn += surplus;
+                assert_public_stock_census(
+                    &format!("INV-086 resolved surplus withdrawal {domain}"),
+                    &runner.env,
+                )?;
+            }
+            // One atom beyond the surplus is the receipt's reserve and must roll back exactly.
+            let market_before = runner.env.svm.get_account(&runner.env.market);
+            let vault_before = runner.env.svm.get_account(&runner.env.vault);
+            runner
+                .env
+                .withdraw_backing_bucket(domain as u16, 1)
+                .expect_err("INV-086 pledged resolved reserve must not be withdrawable");
+            if runner.env.svm.get_account(&runner.env.market) != market_before
+                || runner.env.svm.get_account(&runner.env.vault) != vault_before
+            {
+                return Err(format!(
+                    "INV-086 rejected reserve withdrawal on domain {domain} did not roll back exactly"
+                ));
+            }
+            surplus_overdraw_rejections += 1;
+        }
+        // With the receipt open, terminal wind-down cannot sweep the pledged reserve.
+        let market_before = runner.env.svm.get_account(&runner.env.market);
+        let vault_before = runner.env.svm.get_account(&runner.env.vault);
+        let supply_before = runner.env.mint_supply();
+        runner
+            .env
+            .close_primary_slab()
+            .expect_err("INV-086 CloseSlab must wait for the open partial receipt");
+        if runner.env.svm.get_account(&runner.env.market) != market_before
+            || runner.env.svm.get_account(&runner.env.vault) != vault_before
+            || runner.env.mint_supply() != supply_before
+        {
+            return Err("INV-086 blocked pre-expiry CloseSlab did not roll back exactly".into());
+        }
+        pre_expiry_slab_close_rejected = true;
+        // Exact and late expiry landings: the payout campaign starts at the cleanup slot.
+        if runner.env.current_slot() < terminal_cleanup_slot {
+            runner.env.warp_to_slot(terminal_cleanup_slot);
         }
     }
+    let payout_campaign_start_slot = runner.env.current_slot();
+    runner.run_terminal_payout_campaign()?;
+    runner.assert_global_invariants()?;
+    let mut terminal_landing_slot = runner.env.current_slot();
     let destination_after = u128::from(
         runner
             .env
@@ -15138,7 +15233,7 @@ fn finish_close_to_partial_receipt_composition(
         .map_err(|error| format!("INV-086 close bridge terminal receipt decode: {error:?}"))?;
     let final_engine_vault = runner.env.primary_market_state().1.vault;
     let final_spl_vault = u128::from(runner.env.token_amount(runner.env.vault));
-    let mut max_compute_units = runner.coverage.max_cu;
+    let mut max_compute_units = runner.coverage.max_cu.max(max_compute_units_pre);
     let terminal_actor_count = (0..PRIMARY_ACTOR_COUNT)
         .map(|actor| runner.portfolio_is_economically_terminal(actor))
         .collect::<Result<Vec<_>, _>>()?
@@ -15160,7 +15255,11 @@ fn finish_close_to_partial_receipt_composition(
     let mut slab_close_compute_units = 0u64;
     let mut slab_closed = false;
     if let Some(terminal_cleanup_slot) = terminal_cleanup_slot {
+        // The open receipt held the reserve until it lapsed, so cleanup lands no earlier
+        // than the requested slot and no earlier than the lapse the campaign reached.
+        let terminal_cleanup_slot = terminal_cleanup_slot.max(runner.env.current_slot());
         runner.env.warp_to_slot(terminal_cleanup_slot);
+        terminal_landing_slot = terminal_cleanup_slot;
         for actor in 0..PRIMARY_ACTOR_COUNT {
             let close = runner
                 .env
@@ -15433,6 +15532,13 @@ fn finish_close_to_partial_receipt_composition(
         slab_custody_burned,
         slab_close_compute_units,
         slab_closed,
+        resolved_junior_need,
+        pre_expiry_fresh_backing,
+        resolved_surplus_withdrawn,
+        surplus_overdraw_rejections,
+        pre_expiry_slab_close_rejected,
+        terminal_landing_slot,
+        payout_campaign_start_slot,
     })
 }
 
